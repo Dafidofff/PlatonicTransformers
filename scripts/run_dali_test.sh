@@ -10,8 +10,8 @@
 set -eo pipefail
 
 # ─── Environment ─────────────────────────────────────────────────────────────
-source ~/miniconda3/etc/profile.d/conda.sh
-conda activate plato-dali
+# Activate uv venv
+source ~/imagenet/PlatonicTransformers/.venv/bin/activate
 
 export DALI_NO_MMAP=1
 
@@ -22,7 +22,7 @@ module load CUDA/12.8.0
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # ─── Run ─────────────────────────────────────────────────────────────────────
-cd /gpfs/work4/0/prjs1709/PlatonicTransformers
+cd ~/imagenet/PlatonicTransformers
 mkdir -p logs
 
 python tests/test_imagenet_dali.py \

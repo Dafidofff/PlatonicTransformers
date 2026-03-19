@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gres=gpu:4
-#SBATCH --cpus-per-task=64
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=16
 #SBATCH --partition=gpu_h100
 #SBATCH --time=2-00:00:00
 #SBATCH --output=logs/%x_%j.out
@@ -23,15 +23,9 @@ export LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}"
 export DALI_NO_MMAP=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-# Prevent Lightning from auto-detecting SLURM
-unset SLURM_NTASKS
-unset SLURM_NTASKS_PER_NODE
-
 # ─── Verify ──────────────────────────────────────────────────────────────────
 echo "Node:  $(hostname)"
 echo "GPUs:  $(nvidia-smi -L)"
-echo "nvcc:  $(nvcc --version | tail -1)"
-echo "CUDA_HOME: ${CUDA_HOME}"
 
 # ─── Run ─────────────────────────────────────────────────────────────────────
 cd ~/imagenet/PlatonicTransformers
@@ -40,8 +34,8 @@ mkdir -p logs
 python mains/main_imagenet.py \
     --config configs/imagenet_dali.yaml \
     --dataset.data_dir=/scratch-nvme/ml-datasets/imagenet/torchvision_ImageFolder \
-    --training.epochs=300 \
-    --training.batch_size=1024 \
-    --model.solid_name=trivial_2 --model.num_heads=12 \
-    --system.gpus=4 \
+    --training.epochs=100 \
+    --training.batch_size=256 \
+    --model.solid_name=cyclic_4 --model.num_heads=12 \
+    --system.gpus=1 \
     --logging.enabled=true 2>&1
