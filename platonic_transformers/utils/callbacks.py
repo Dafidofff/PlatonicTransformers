@@ -19,20 +19,30 @@ class TimerCallback(pl.Callback):
         self.total_training_start_time = 0.0
         self.epoch_start_time = 0.0
         self.test_inference_time = 0.0
+        self._train_epoch_start_time = 0.0
 
     def on_train_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
         self.total_training_start_time = time.time()
 
+    def on_train_epoch_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        self._train_epoch_start_time = time.time()
+
+    def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        epoch_time_min = (time.time() - self._train_epoch_start_time) / 60
+        pl_module.log("epoch_time_min", epoch_time_min, sync_dist=True)
+
     def on_train_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
         total_training_time = (time.time() - self.total_training_start_time) / 60
-        trainer.logger.experiment.log({"Total Training Time (min)": total_training_time})
+        if trainer.logger is not None:
+            trainer.logger.experiment.log({"Total Training Time (min)": total_training_time})
 
     def on_test_epoch_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
         self.epoch_start_time = time.time()
 
     def on_test_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
         self.test_inference_time = (time.time() - self.epoch_start_time) / 60
-        trainer.logger.experiment.log({"Test Inference Time (min)": self.test_inference_time})
+        if trainer.logger is not None:
+            trainer.logger.experiment.log({"Test Inference Time (min)": self.test_inference_time})
 
 
 class StopOnPersistentDivergence(pl.Callback):

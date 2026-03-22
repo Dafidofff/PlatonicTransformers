@@ -435,13 +435,20 @@ def load_data(
             )
 
     # Wrap DALI iterators
+    # NOTE on multi-GPU (DDP):
+    # - Train uses FILL policy so every GPU sees the same number of batches.
+    #   With DROP, uneven shard remainders can cause one GPU to finish its
+    #   training loop before the others, leading to an NCCL deadlock.
+    # - prepare_first_batch=False avoids DALI prefetching before the DDP
+    #   process group is fully initialised.
     train_loader = _DALIGraphBatchWrapper(
         DALIGenericIterator(
             train_pipe,
             output_map=["images", "labels"],
             reader_name="reader",
-            last_batch_policy=LastBatchPolicy.DROP,
+            last_batch_policy=LastBatchPolicy.FILL,
             auto_reset=True,
+            prepare_first_batch=False,
         ),
         patch_size=patch_size,
         image_size=final_image_size,
@@ -456,6 +463,7 @@ def load_data(
         reader_name="reader",
         last_batch_policy=LastBatchPolicy.PARTIAL,
         auto_reset=True,
+        prepare_first_batch=False,
     )
     val_loader = _DALIGraphBatchWrapper(
         val_iter,

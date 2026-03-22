@@ -6,6 +6,8 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
+import datetime
+
 import ml_collections
 import pytorch_lightning as pl
 import torch
@@ -30,8 +32,50 @@ try:
 except ImportError:
     _quack_cross_entropy = None
 
-# Performance optimization
+# Performance optimization (defaults, can be overridden via config.system)
 torch.set_float32_matmul_precision('medium')
+
+
+class ImageNetDataModule(pl.LightningDataModule):
+    """LightningDataModule that creates DALI pipelines AFTER DDP is initialised.
+
+    This is critical for multi-GPU: DALI needs the correct LOCAL_RANK and
+    WORLD_SIZE to shard data and place pipelines on the right GPU.  Those
+    environment variables are only set after Lightning spawns the DDP workers,
+    so the pipelines must be built inside ``setup()`` rather than in ``__init__``.
+    """
+
+    def __init__(self, config: ml_collections.ConfigDict) -> None:
+        super().__init__()
+        self.config = config
+        self._train_loader = None
+        self._val_loader = None
+
+    def setup(self, stage: str = None) -> None:
+        if self._train_loader is not None:
+            return  # already built
+
+        from platonic_transformers.datasets.imagenet_dali import load_data
+
+        self._train_loader, self._val_loader, _ = load_data(self.config)
+
+        # Debug: log iterator lengths per rank
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        print(
+            f"[RANK {local_rank}/{world_size}] train_loader len={len(self._train_loader)}, "
+            f"val_loader len={len(self._val_loader)}",
+            flush=True,
+        )
+
+    def train_dataloader(self):
+        return self._train_loader
+
+    def val_dataloader(self):
+        return self._val_loader
+
+    def test_dataloader(self):
+        return self._val_loader
 
 
 class ImageNetModel(pl.LightningModule):
@@ -127,7 +171,12 @@ class ImageNetModel(pl.LightningModule):
         elif self.config.training.loss_fn == "bce":
             y_one_hot = F.one_hot(y, num_classes=self.config.dataset.num_classes).to(dtype=pred.dtype, device=pred.device)
             return F.binary_cross_entropy_with_logits(pred, y_one_hot)
-        elif _quack_cross_entropy is not None and pred.is_cuda:
+        elif (
+            _quack_cross_entropy is not None
+            and pred.is_cuda
+            and self.config.system.gpus <= 1
+        ):
+            # quack cross_entropy backward has stride issues with DDP
             return _quack_cross_entropy(pred, y, reduction='mean')
         else:
             return F.cross_entropy(pred, y)
@@ -147,7 +196,7 @@ class ImageNetModel(pl.LightningModule):
         loss = self._calculate_loss(pred, data.y)
         self.valid_metric(pred, data.y)
         self.valid_metric_top5(pred, data.y)
-        self.log("valid_loss", loss, batch_size=self.config.training.batch_size)
+        self.log("valid_loss", loss, batch_size=self.config.training.batch_size, sync_dist=True)
 
     def test_step(self, data, batch_idx: int) -> None:
         pred = self(data)
@@ -155,16 +204,16 @@ class ImageNetModel(pl.LightningModule):
         self.test_metric_top5(pred, data.y)
 
     def on_train_epoch_end(self) -> None:
-        self.log("train_acc_top1", self.train_metric, prog_bar=True)
-        self.log("train_acc_top5", self.train_metric_top5)
+        self.log("train_acc_top1", self.train_metric, prog_bar=True, sync_dist=True)
+        self.log("train_acc_top5", self.train_metric_top5, sync_dist=True)
 
     def on_validation_epoch_end(self) -> None:
-        self.log("valid_acc_top1", self.valid_metric, prog_bar=True)
-        self.log("valid_acc_top5", self.valid_metric_top5)
+        self.log("valid_acc_top1", self.valid_metric, prog_bar=True, sync_dist=True)
+        self.log("valid_acc_top5", self.valid_metric_top5, sync_dist=True)
 
     def on_test_epoch_end(self) -> None:
-        self.log("test_acc_top1", self.test_metric, prog_bar=True)
-        self.log("test_acc_top5", self.test_metric_top5)
+        self.log("test_acc_top1", self.test_metric, prog_bar=True, sync_dist=True)
+        self.log("test_acc_top5", self.test_metric_top5, sync_dist=True)
 
     def transfer_batch_to_device(self, batch, device, dataloader_idx):
         """Move any straggling CPU tensors (e.g. DALI labels) to the target device."""
@@ -200,22 +249,21 @@ class ImageNetModel(pl.LightningModule):
         return {"optimizer": optimizer, "lr_scheduler": scheduler}
 
 
-def load_data(
-    config: ml_collections.ConfigDict,
-) -> Tuple:
-    """Load ImageNet data via DALI pipeline."""
-    from platonic_transformers.datasets.imagenet_dali import load_data as _load_data
-    return _load_data(config)
-
-
 def main(config: ml_collections.ConfigDict) -> None:
     """Train and evaluate the Platonic Transformer on ImageNet."""
 
     print_config(config, "ImageNet Training Configuration")
 
+    # Hardware optimizations (configurable via config.system)
+    if getattr(config.system, 'cudnn_benchmark', True):
+        torch.backends.cudnn.benchmark = True
+    if getattr(config.system, 'flash_sdp', True):
+        torch.backends.cuda.enable_flash_sdp(True)
+
     pl.seed_everything(config.seed)
 
-    train_loader, val_loader, test_loader = load_data(config)
+    # Data module defers DALI pipeline creation until after DDP init
+    data_module = ImageNetDataModule(config)
 
     # Configure accelerator
     if config.system.gpus > 0:
@@ -247,27 +295,45 @@ def main(config: ml_collections.ConfigDict) -> None:
     if config.logging.enabled:
         callbacks.append(pl.callbacks.LearningRateMonitor(logging_interval='epoch'))
 
+    # Gradient accumulation (effective_bs = batch_size * gpus * accumulate_grad_batches)
+    accumulate_grad_batches = getattr(config.training, 'accumulate_grad_batches', 1)
+
+    # Optional batch limits for fast debugging
+    limit_train_batches = getattr(config.training, 'limit_train_batches', 1.0)
+    limit_val_batches = getattr(config.training, 'limit_val_batches', 1.0)
+
     trainer = pl.Trainer(
         logger=logger,
         max_epochs=config.training.epochs,
         callbacks=callbacks,
         gradient_clip_val=config.training.gradient_clip_val,
+        accumulate_grad_batches=accumulate_grad_batches,
         accelerator=accelerator,
         devices=devices,
         enable_progress_bar=config.system.enable_progress_bar,
         precision=getattr(config.system, 'precision', 'bf16-mixed'),
-        strategy=DDPStrategy(find_unused_parameters=True) if config.system.gpus > 1 else 'auto',
+        limit_train_batches=limit_train_batches,
+        limit_val_batches=limit_val_batches,
+        strategy=DDPStrategy(
+            find_unused_parameters=True,
+            timeout=datetime.timedelta(minutes=30),
+        ) if config.system.gpus > 1 else 'auto',
+        use_distributed_sampler=False,  # DALI handles sharding internally
         num_sanity_val_steps=0,  # DALI iterators don't support mid-epoch resets
     )
 
     test_ckpt = config.testing.test_ckpt
+    resume_ckpt = getattr(config.testing, 'resume_ckpt', None)
     if test_ckpt is None:
         model = ImageNetModel(config)
-        trainer.fit(model, train_loader, val_loader)
-        trainer.test(model, test_loader, ckpt_path='best')
+        if getattr(config.system, 'compile', False):
+            print("Compiling model with torch.compile...")
+            model.net = torch.compile(model.net)
+        trainer.fit(model, datamodule=data_module, ckpt_path=resume_ckpt)
+        trainer.test(model, datamodule=data_module, ckpt_path='best')
     else:
         model = ImageNetModel.load_from_checkpoint(test_ckpt)
-        trainer.test(model, test_loader)
+        trainer.test(model, datamodule=data_module)
 
 
 if __name__ == "__main__":
