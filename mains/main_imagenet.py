@@ -220,20 +220,62 @@ class ImageNetModel(pl.LightningModule):
         return batch.to(device)
 
     def configure_optimizers(self) -> dict:
-        """Configure optimizer and learning rate scheduler."""
+        """Configure optimizer and learning rate scheduler.
+
+        Splits parameters into decay / no-decay groups following DeiT-III:
+        weight decay is NOT applied to biases, LayerScale gammas, learned
+        positional-encoding frequencies, or normalization layer weights.
+        """
+        decay = set()
+        no_decay = set()
+        whitelist_weight_modules = (torch.nn.Linear,)
+        blacklist_weight_modules = (torch.nn.LayerNorm, torch.nn.Embedding)
+
+        for mn, module in self.named_modules():
+            for pn, _ in module.named_parameters(recurse=False):
+                full_name = f"{mn}.{pn}" if mn else pn
+                if pn == 'freqs':
+                    no_decay.add(full_name)
+                elif pn.endswith('bias') or ('layer_scale' in pn) or ('gamma' in pn):
+                    no_decay.add(full_name)
+                elif pn.endswith('weight') and isinstance(module, whitelist_weight_modules):
+                    decay.add(full_name)
+                elif pn.endswith('kernel'):
+                    decay.add(full_name)
+                elif pn.endswith('weight') and isinstance(module, blacklist_weight_modules):
+                    no_decay.add(full_name)
+
+        param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
+        missing = param_dict.keys() - (decay | no_decay)
+        if missing:
+            print(f"Params not explicitly assigned (adding to no_decay): {missing}")
+            no_decay.update(missing)
+
+        assert len(decay & no_decay) == 0, f"Overlap: {decay & no_decay}"
+
+        optim_groups = [
+            g for g in [
+                {"params": [param_dict[n] for n in sorted(decay) if n in param_dict],
+                 "weight_decay": self.config.optimizer.weight_decay},
+                {"params": [param_dict[n] for n in sorted(no_decay) if n in param_dict],
+                 "weight_decay": 0.0},
+            ] if g["params"]
+        ]
+        print(f"Optimizer: {sum(p.numel() for g in optim_groups for p in g['params'])/1e6:.1f}M params "
+              f"({sum(p.numel() for p in optim_groups[0]['params'])/1e6:.1f}M decay, "
+              f"{sum(p.numel() for p in optim_groups[1]['params'])/1e6:.1f}M no_decay)")
+
         optimizer_name = self.config.optimizer.name.lower()
         if optimizer_name == "adamw":
             optimizer = torch.optim.AdamW(
-                self.parameters(),
+                optim_groups,
                 lr=self.config.optimizer.lr,
-                weight_decay=self.config.optimizer.weight_decay,
             )
         elif optimizer_name == "lamb":
             from timm.optim import Lamb
             optimizer = Lamb(
-                self.parameters(),
+                optim_groups,
                 lr=self.config.optimizer.lr,
-                weight_decay=self.config.optimizer.weight_decay,
             )
         else:
             raise ValueError(
