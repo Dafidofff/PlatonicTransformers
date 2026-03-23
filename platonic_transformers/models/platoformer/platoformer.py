@@ -52,6 +52,7 @@ class PlatonicTransformer(nn.Module):
         scalar_task_level: str = "graph",
         vector_task_level: str = "node",
         ffn_readout: bool = True,
+        trivial_readout: bool = False,  # if True, pool over group before readout (standard linear layers)
         # Attention block specification:
         mean_aggregation: bool = False,
         dropout: float = 0.1,
@@ -86,13 +87,19 @@ class PlatonicTransformer(nn.Module):
         self.output_dim = output_dim
         self.output_dim_vec = output_dim_vec
         self.mean_aggregation = mean_aggregation
+        self.trivial_readout = trivial_readout
+        if trivial_readout:
+            trivial_name = f"trivial_{spatial_dim}"
+            self.readout_group = PLATONIC_GROUPS[trivial_name]
+        else:
+            self.readout_group = self.group
 
         # Global position embedding for fixed patching ViTs
         if ape_sigma is not None:
             self.ape = APE(hidden_dim, solid_name, ape_sigma, spatial_dim, learned_freqs)
         else:
             self.register_buffer('ape', None)
-               
+
         # --- Modules ---
         # 1. Input Embedding: Applied before lifting to the group.
         # Maps input features to the per-group-element hidden dimension.
@@ -121,24 +128,46 @@ class PlatonicTransformer(nn.Module):
                 attention=attention,
                 use_key=use_key,
             ))
-            
-        if ffn_readout:
-            self.scalar_readout = nn.Sequential(
-                PlatonicLinear(self.hidden_dim, self.hidden_dim, solid_name),
-                nn.GELU(),
-                PlatonicLinear(self.hidden_dim, self.num_G * output_dim, solid_name)
-            )
-            
-            self.vector_readout = nn.Sequential(
-                PlatonicLinear(self.hidden_dim, self.hidden_dim, solid_name),
-                nn.GELU(),
-                PlatonicLinear(self.hidden_dim, self.hidden_dim, solid_name),
-                nn.GELU(),
-                PlatonicLinear(self.hidden_dim, self.num_G * output_dim_vec * spatial_dim, solid_name)
-            )
+
+        # 3. Readout layers
+        if trivial_readout:
+            # Switch to trivial group before readout: pool over group dimension
+            # via to_scalars_vectors, then use PlatonicLinear with trivial group.
+            # This keeps the full hidden_dim but removes equivariance constraints.
+            trivial_name = f"trivial_{spatial_dim}"
+            if ffn_readout:
+                self.scalar_readout = nn.Sequential(
+                    PlatonicLinear(self.hidden_dim, self.hidden_dim, trivial_name),
+                    nn.GELU(),
+                    PlatonicLinear(self.hidden_dim, output_dim, trivial_name)
+                )
+                self.vector_readout = nn.Sequential(
+                    PlatonicLinear(self.hidden_dim, self.hidden_dim, trivial_name),
+                    nn.GELU(),
+                    PlatonicLinear(self.hidden_dim, self.hidden_dim, trivial_name),
+                    nn.GELU(),
+                    PlatonicLinear(self.hidden_dim, output_dim_vec * spatial_dim, trivial_name)
+                )
+            else:
+                self.scalar_readout = PlatonicLinear(self.hidden_dim, output_dim, trivial_name)
+                self.vector_readout = PlatonicLinear(self.hidden_dim, output_dim_vec * spatial_dim, trivial_name)
         else:
-            self.scalar_readout = PlatonicLinear(self.hidden_dim, self.num_G * output_dim, solid_name)
-            self.vector_readout = PlatonicLinear(self.hidden_dim, self.num_G * output_dim_vec * spatial_dim, solid_name)
+            if ffn_readout:
+                self.scalar_readout = nn.Sequential(
+                    PlatonicLinear(self.hidden_dim, self.hidden_dim, solid_name),
+                    nn.GELU(),
+                    PlatonicLinear(self.hidden_dim, self.num_G * output_dim, solid_name)
+                )
+                self.vector_readout = nn.Sequential(
+                    PlatonicLinear(self.hidden_dim, self.hidden_dim, solid_name),
+                    nn.GELU(),
+                    PlatonicLinear(self.hidden_dim, self.hidden_dim, solid_name),
+                    nn.GELU(),
+                    PlatonicLinear(self.hidden_dim, self.num_G * output_dim_vec * spatial_dim, solid_name)
+                )
+            else:
+                self.scalar_readout = PlatonicLinear(self.hidden_dim, self.num_G * output_dim, solid_name)
+                self.vector_readout = PlatonicLinear(self.hidden_dim, self.num_G * output_dim_vec * spatial_dim, solid_name)
 
     def forward(self,
                 x: Tensor,
@@ -204,9 +233,11 @@ class PlatonicTransformer(nn.Module):
         scalar_x = self.scalar_readout(scalar_x)
         vector_x = self.vector_readout(vector_x)
 
-        # 5. Extract the scalar and vector parts
-        scalars = to_scalars_vectors(scalar_x, self.output_dim, 0, self.group)[0]
-        vectors = to_scalars_vectors(vector_x, 0, self.output_dim_vec, self.group)[1]
+        # Extract scalar and vector predictions via group-equivariant readout.
+        # When trivial_readout=True, readout_group is the trivial group (G=1),
+        # so to_scalars_vectors just reshapes without averaging over group elements.
+        scalars = to_scalars_vectors(scalar_x, self.output_dim, 0, self.readout_group)[0]
+        vectors = to_scalars_vectors(vector_x, 0, self.output_dim_vec, self.readout_group)[1]
 
         # Return final result
         return scalars, vectors
