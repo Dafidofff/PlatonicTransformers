@@ -20,6 +20,7 @@ class TimerCallback(pl.Callback):
         self.epoch_start_time = 0.0
         self.test_inference_time = 0.0
         self._train_epoch_start_time = 0.0
+        self._val_epoch_start_time = 0.0
 
     def on_train_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
         self.total_training_start_time = time.time()
@@ -28,8 +29,34 @@ class TimerCallback(pl.Callback):
         self._train_epoch_start_time = time.time()
 
     def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
-        epoch_time_min = (time.time() - self._train_epoch_start_time) / 60
+        epoch_time_sec = time.time() - self._train_epoch_start_time
+        epoch_time_min = epoch_time_sec / 60
         pl_module.log("epoch_time_min", epoch_time_min, sync_dist=True)
+        pl_module.log("train_epoch_time_sec", epoch_time_sec, sync_dist=True)
+        # Training throughput
+        try:
+            num_batches = trainer.num_training_batches
+            bs = trainer.train_dataloader.batch_size
+            if num_batches and bs and epoch_time_sec > 0:
+                pl_module.log("train_throughput_samples_per_sec", num_batches * bs / epoch_time_sec, sync_dist=True)
+        except Exception:
+            pass
+
+    def on_validation_epoch_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        self._val_epoch_start_time = time.time()
+
+    def on_validation_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        val_time_sec = time.time() - self._val_epoch_start_time
+        pl_module.log("val_epoch_time_sec", val_time_sec, sync_dist=True)
+        pl_module.log("val_epoch_time_min", val_time_sec / 60, sync_dist=True)
+        # Validation throughput (inference)
+        try:
+            num_batches = trainer.num_val_batches[0] if trainer.num_val_batches else 0
+            bs = trainer.val_dataloaders.batch_size
+            if num_batches and bs and val_time_sec > 0:
+                pl_module.log("val_throughput_samples_per_sec", num_batches * bs / val_time_sec, sync_dist=True)
+        except Exception:
+            pass
 
     def on_train_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
         total_training_time = (time.time() - self.total_training_start_time) / 60
@@ -414,3 +441,43 @@ class NaNDetectorCallback(pl.callbacks.Callback):
         for hook in self.hooks:
             hook.remove()
         self.hooks.clear()
+
+
+class StepTimerCallback(pl.Callback):
+    """Log per-step wall time for benchmarking. Not for production use.
+    
+    Logs avg/median/p95 step time at the end of each epoch, skipping the
+    first `warmup_steps` steps to exclude compile and data-loading warmup.
+    """
+
+    def __init__(self, warmup_steps: int = 20) -> None:
+        super().__init__()
+        self.warmup_steps = warmup_steps
+        self._step_start: float = 0.0
+        self._step_times: List[float] = []
+        self._step_count: int = 0
+
+    def on_train_batch_start(self, trainer, pl_module, batch, batch_idx) -> None:
+        self._step_start = time.perf_counter()
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx) -> None:
+        elapsed = time.perf_counter() - self._step_start
+        self._step_count += 1
+        if self._step_count > self.warmup_steps:
+            self._step_times.append(elapsed)
+
+    def on_train_epoch_end(self, trainer, pl_module) -> None:
+        if self._step_times:
+            times = np.array(self._step_times)
+            avg = float(np.mean(times))
+            median = float(np.median(times))
+            p95 = float(np.percentile(times, 95))
+            pl_module.log("step_time_avg_sec", avg, sync_dist=True)
+            pl_module.log("step_time_median_sec", median, sync_dist=True)
+            pl_module.log("step_time_p95_sec", p95, sync_dist=True)
+            print(
+                f"Step timing ({len(times)} steps after {self.warmup_steps} warmup): "
+                f"avg={avg:.4f}s, median={median:.4f}s, p95={p95:.4f}s"
+            )
+        self._step_times.clear()
+        self._step_count = 0

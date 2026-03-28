@@ -137,3 +137,66 @@ First full 100-epoch runs. rope_σ=1.0, ape_σ=10.0, random freq init.
 - Data at `/scratch-nvme/ml-datasets/imagenet/torchvision_ImageFolder`
 - Checkpoints saved to `mains/logs/Platonic-ImageNet/<wandb_run_id>/checkpoints/`
 - Resume: `RESUME_CKPT=/path/to/last.ckpt sbatch scripts/run_imagenet_*.sh`
+
+---
+
+## v4 Runs (2026-03-28) — DeiT-III Fix
+
+**Branch:** `feature/deit3-v4-fixes`
+
+### Changes from v3
+1. **random_erasing_prob=0.0** — was leaking 0.25 from YAML default, now explicitly overridden in CLI
+2. **gradient_as_bucket_view=True** in DDPStrategy — reduces memory copies during gradient all-reduce
+3. No other recipe changes. Same 3-Augment, BCE, LAMB lr=3e-3, etc.
+
+### Known remaining gaps vs DeiT-III (83.1%)
+- Repeated Augmentation: not implemented (~unknown impact, no ablation in DeiT-III paper)
+- Mean pooling vs CLS token: architectural difference (~0.5-1pp)
+- timm Lamb vs Apex FusedLAMB: minor (~0.1-0.3pp)
+
+### v4 trivial_2 run
+- **W&B project:** Platonic-ImageNet-v4
+- **W&B run:** earthy-galaxy-3 (kmkaxifd), resumed as job 21277828
+- **Config:** 4×H100, bs=512 (eff 2048), 400 epochs, compile=true
+- **Status:** Running, resumed from epoch 12
+- **Early results:** +0.81pp ahead of v3 at epoch 12
+
+### How to launch flop_2d_2 v4 (on any server with DALI + ImageNet)
+
+```bash
+# Ensure you are on branch feature/deit3-v4-fixes
+git checkout feature/deit3-v4-fixes
+
+# The key changes from v3 are:
+#   --augmentation.random_erasing_prob=0.0
+#   gradient_as_bucket_view=True in mains/main_imagenet.py DDPStrategy
+
+# Launch flop_2d_2 (adjust data_dir and gpus for your server):
+python mains/main_imagenet.py \
+    --config configs/imagenet_dali.yaml \
+    --dataset.data_dir=/path/to/imagenet/torchvision_ImageFolder \
+    --dataset.eval_crop_ratio=1.0 \
+    --augmentation.rand_augment="" \
+    --augmentation.random_erasing_prob=0.0 \
+    --mixup.label_smoothing=0.0 \
+    --training.epochs=400 \
+    --training.batch_size=512 \
+    --model.solid_name=flop_2d_2 \
+    --model.hidden_dim=768 --model.num_heads=12 --model.num_layers=12 \
+    --model.freq_init=spiral --model.learned_freqs=true \
+    --model.drop_path_rate=0.1 --model.layer_scale_init_value=1e-4 \
+    --model.attention=true --model.dense_mode=true \
+    --model.ffn_readout=false --model.use_key=false \
+    --optimizer.name=lamb --optimizer.lr=3e-3 --optimizer.weight_decay=0.02 \
+    --scheduler.warmup_epochs=5 \
+    --system.gpus=4 \
+    --system.cudnn_benchmark=true --system.flash_sdp=true --system.compile=true \
+    --logging.enabled=true --logging.project_name=Platonic-ImageNet-v4
+```
+
+### Also consider: flop_2d_2_wide (1088, ~79.5M params)
+Same command but with:
+```
+    --model.solid_name=flop_2d_2 \
+    --model.hidden_dim=1088 --model.num_heads=16 \
+```

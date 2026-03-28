@@ -24,7 +24,7 @@ from platonic_transformers.utils.config_loader import (
 from platonic_transformers.models.platoformer.platoformer import PlatonicTransformer
 from platonic_transformers.models.platoformer.groups import PLATONIC_GROUPS
 from platonic_transformers.utils.utils import CosineWarmupScheduler, RandomSOd
-from platonic_transformers.utils.callbacks import TimerCallback
+from platonic_transformers.utils.callbacks import TimerCallback, StepTimerCallback
 
 # Use quack's fused cross-entropy kernel when available (H100+)
 try:
@@ -335,6 +335,8 @@ def main(config: ml_collections.ConfigDict) -> None:
         ),
         TimerCallback(),
     ]
+    if getattr(config.system, "benchmark_steps", False):
+        callbacks.append(StepTimerCallback(warmup_steps=20))
     if config.logging.enabled:
         callbacks.append(pl.callbacks.LearningRateMonitor(logging_interval='epoch'))
 
@@ -359,6 +361,7 @@ def main(config: ml_collections.ConfigDict) -> None:
         limit_val_batches=limit_val_batches,
         strategy=DDPStrategy(
             find_unused_parameters=True,
+            gradient_as_bucket_view=True,
             timeout=datetime.timedelta(minutes=30),
         ) if config.system.gpus > 1 else 'auto',
         use_distributed_sampler=False,  # DALI handles sharding internally
